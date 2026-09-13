@@ -15,7 +15,7 @@ sudo install -m 644 deploy/docker-digest-updater.override.conf /etc/systemd/syst
 sudoedit /etc/deploy-telegram-notifier.env
 sudo systemctl daemon-reload
 sudo systemctl restart docker-digest-updater.service
-sudo -E /usr/local/bin/deploy-telegram-notifier test
+sudo sh -c 'set -a; . /etc/deploy-telegram-notifier.env; set +a; exec /usr/local/bin/deploy-telegram-notifier test'
 ```
 
 For a user systemd service, put the same environment variables in the user service environment instead of a root-owned file and set `DEPLOY_TELEGRAM_NOTIFIER_BIN` to the installed binary.
