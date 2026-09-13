@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - run: go test ./...
+      - name: Build static binary
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath -ldflags='-s -w' -o deploy-telegram-notifier-linux-${GOARCH} ./cmd/deploy-telegram-notifier
+      - run: sha256sum deploy-telegram-notifier-linux-${{ matrix.goarch }} > deploy-telegram-notifier-linux-${{ matrix.goarch }}.sha256
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            deploy-telegram-notifier-linux-${{ matrix.goarch }}
+            deploy-telegram-notifier-linux-${{ matrix.goarch }}.sha256
