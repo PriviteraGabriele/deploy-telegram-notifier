@@ -10,24 +10,33 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        goarch: [amd64, arm64]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
           go-version: stable
       - run: go test ./...
-      - name: Build static binary
+      - name: Build static Linux binaries
         env:
           CGO_ENABLED: "0"
           GOOS: linux
-          GOARCH: ${{ matrix.goarch }}
-        run: go build -trimpath -ldflags='-s -w' -o deploy-telegram-notifier-linux-${GOARCH} ./cmd/deploy-telegram-notifier
-      - run: sha256sum deploy-telegram-notifier-linux-${{ matrix.goarch }} > deploy-telegram-notifier-linux-${{ matrix.goarch }}.sha256
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            deploy-telegram-notifier-linux-${{ matrix.goarch }}
-            deploy-telegram-notifier-linux-${{ matrix.goarch }}.sha256
+        run: |
+          for arch in amd64 arm64; do
+            GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "deploy-telegram-notifier-linux-$arch" ./cmd/deploy-telegram-notifier
+            sha256sum "deploy-telegram-notifier-linux-$arch" > "deploy-telegram-notifier-linux-$arch.sha256"
+          done
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          assets=(
+            deploy-telegram-notifier-linux-amd64
+            deploy-telegram-notifier-linux-amd64.sha256
+            deploy-telegram-notifier-linux-arm64
+            deploy-telegram-notifier-linux-arm64.sha256
+          )
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" --generate-notes "${assets[@]}"
+          fi
