@@ -13,6 +13,8 @@ TELEGRAM_BOT_TOKEN=123456:replace-with-the-bot-token
 TELEGRAM_CHAT_ID=-1001234567890
 # TELEGRAM_MESSAGE_THREAD_ID=42
 # DEPLOY_NOTIFIER_STATE_DIR=/var/lib/deploy-telegram-notifier
+# DEPLOY_NOTIFIER_APP_URL=https://app.example.com
+# DEPLOY_NOTIFIER_DELAY_THRESHOLD=5m
 ```
 
 The notifier expects these OCI labels in each deployed image:
@@ -34,13 +36,18 @@ org.opencontainers.image.revision
 deploy-telegram-notifier test
 docker image inspect example/image:tag | deploy-telegram-notifier event \
   --project worth-split --service api --status succeeded --stage healthcheck \
-  --expected-services api,web --health-url https://example.com/healthz
+  --expected-services api,web --health-url https://example.com/healthz \
+  --app-url https://example.com
 deploy-telegram-notifier sweep
 docker image inspect example/image:tag | deploy-telegram-notifier pending --project worth-split
+deploy-telegram-notifier history --project worth-split
+deploy-telegram-notifier test --scenario recovery --app-url https://example.com
 ```
 
-`event` accepts `started`, `succeeded`, and `failed`. A failure event may use `--previous-online` when the old container was kept running. `sweep` reports a release that remains incomplete for ten minutes.
+`event` accepts `started`, `succeeded`, and `failed`. A failure event may use `--previous-online` when the old container was kept running and `--reason` for a short, non-sensitive diagnostic. `sweep` reports a deployment delay after five minutes by default, then an incomplete release after ten minutes. Configure the first threshold with `DEPLOY_NOTIFIER_DELAY_THRESHOLD`.
 `pending` is used by the updater to retry only releases that previously failed their final readiness check.
+`history` prints the release events kept locally for up to 30 days. It is intentionally a local operational history, not a database or central audit system.
+`test --scenario failure|recovery|delayed|rollback` sends synthetic Telegram events through the same state machine without touching Docker, migrations, or a real project. `rollback` sends the preceding two synthetic successful deploys as context, then the rollback result.
 
 ## Build and release
 

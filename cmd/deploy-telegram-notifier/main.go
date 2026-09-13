@@ -21,6 +21,7 @@ const (
 	stateFileName   = "state.json"
 	stateMaxAge     = 30 * 24 * time.Hour
 	releaseTimeout  = 10 * time.Minute
+	delayThreshold  = 5 * time.Minute
 )
 
 type config struct {
@@ -28,6 +29,8 @@ type config struct {
 	ChatID         string
 	ThreadID       string
 	StateDir       string
+	AppURL         string
+	DelayThreshold time.Duration
 	TelegramAPIURL string
 	HTTPClient     *http.Client
 	Now            func() time.Time
@@ -51,7 +54,9 @@ type event struct {
 	Stage            string
 	ExpectedServices []string
 	HealthURL        string
+	AppURL           string
 	PreviousOnline   bool
+	Reason           string
 	ReleaseFallback  string
 	Metadata         metadata
 	At               time.Time
@@ -64,16 +69,23 @@ type serviceState struct {
 }
 
 type release struct {
-	Project          string                  `json:"project"`
-	ReleaseID        string                  `json:"releaseId"`
-	Metadata         metadata                `json:"metadata"`
-	ExpectedServices []string                `json:"expectedServices"`
-	HealthURL        string                  `json:"healthUrl,omitempty"`
-	StartedAt        time.Time               `json:"startedAt"`
-	UpdatedAt        time.Time               `json:"updatedAt"`
-	Services         map[string]serviceState `json:"services"`
-	NotifiedSuccess  bool                    `json:"notifiedSuccess"`
-	NotifiedFailures map[string]bool         `json:"notifiedFailures"`
+	Project           string                  `json:"project"`
+	ReleaseID         string                  `json:"releaseId"`
+	Metadata          metadata                `json:"metadata"`
+	ExpectedServices  []string                `json:"expectedServices"`
+	HealthURL         string                  `json:"healthUrl,omitempty"`
+	AppURL            string                  `json:"appUrl,omitempty"`
+	StartedAt         time.Time               `json:"startedAt"`
+	UpdatedAt         time.Time               `json:"updatedAt"`
+	Services          map[string]serviceState `json:"services"`
+	NotifiedSuccess   bool                    `json:"notifiedSuccess"`
+	NotifiedDelayed   bool                    `json:"notifiedDelayed"`
+	NotifiedFailures  map[string]bool         `json:"notifiedFailures"`
+	PreviousRevision  string                  `json:"previousRevision,omitempty"`
+	PreviousReleaseID string                  `json:"previousReleaseId,omitempty"`
+	Rollback          bool                    `json:"rollback"`
+	LastFailureStage  string                  `json:"lastFailureStage,omitempty"`
+	LastFailureAt     time.Time               `json:"lastFailureAt,omitempty"`
 }
 
 type state struct {
@@ -86,6 +98,7 @@ type notification struct {
 	FailureKey string
 	Service    string
 	Stage      string
+	Reason     string
 	PreviousOK bool
 }
 
@@ -97,7 +110,7 @@ type dockerImage struct {
 
 func main() {
 	if len(os.Args) < 2 {
-		fatal("usage: deploy-telegram-notifier <event|pending|sweep|test>")
+		fatal("usage: deploy-telegram-notifier <event|pending|sweep|history|test>")
 	}
 	cfg, err := loadConfig()
 	if err != nil {
@@ -111,8 +124,10 @@ func main() {
 		err = runPending(cfg, os.Args[2:], os.Stdin)
 	case "sweep":
 		err = runSweep(cfg)
+	case "history":
+		err = runHistory(cfg, os.Args[2:])
 	case "test":
-		err = runTest(cfg)
+		err = runTest(cfg, os.Args[2:])
 	default:
 		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}
@@ -131,11 +146,21 @@ func loadConfig() (config, error) {
 	if stateDir == "" {
 		stateDir = defaultStateDir
 	}
+	delay := delayThreshold
+	if value := os.Getenv("DEPLOY_NOTIFIER_DELAY_THRESHOLD"); value != "" {
+		parsed, err := time.ParseDuration(value)
+		if err != nil || parsed <= 0 {
+			return config{}, fmt.Errorf("DEPLOY_NOTIFIER_DELAY_THRESHOLD must be a positive duration")
+		}
+		delay = parsed
+	}
 	cfg := config{
 		BotToken:       os.Getenv("TELEGRAM_BOT_TOKEN"),
 		ChatID:         os.Getenv("TELEGRAM_CHAT_ID"),
 		ThreadID:       os.Getenv("TELEGRAM_MESSAGE_THREAD_ID"),
 		StateDir:       stateDir,
+		AppURL:         os.Getenv("DEPLOY_NOTIFIER_APP_URL"),
+		DelayThreshold: delay,
 		TelegramAPIURL: os.Getenv("TELEGRAM_API_BASE_URL"),
 		HTTPClient:     &http.Client{Timeout: 10 * time.Second},
 		Now:            func() time.Time { return time.Now().UTC() },
@@ -149,6 +174,9 @@ func loadConfig() (config, error) {
 	if _, err := url.ParseRequestURI(cfg.TelegramAPIURL); err != nil {
 		return config{}, fmt.Errorf("TELEGRAM_API_BASE_URL is invalid: %w", err)
 	}
+	if cfg.AppURL != "" && !validHTTPURL(cfg.AppURL) {
+		return config{}, fmt.Errorf("DEPLOY_NOTIFIER_APP_URL is invalid")
+	}
 	return cfg, nil
 }
 
@@ -161,8 +189,10 @@ func runEvent(cfg config, args []string, input io.Reader) error {
 	stage := flags.String("stage", "", "deployment stage")
 	expected := flags.String("expected-services", "", "comma-separated service names")
 	healthURL := flags.String("health-url", "", "public health URL")
+	appURL := flags.String("app-url", "", "public application URL")
 	previousOnline := flags.Bool("previous-online", false, "whether the prior release is still online")
 	fallback := flags.String("release-fallback", "", "release identifier when image metadata is unavailable")
+	reason := flags.String("reason", "", "safe, short failure reason")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -182,8 +212,8 @@ func runEvent(cfg config, args []string, input io.Reader) error {
 	}
 	return process(cfg, event{
 		Project: *project, Service: *service, Status: *status, Stage: *stage,
-		ExpectedServices: services, HealthURL: *healthURL, PreviousOnline: *previousOnline,
-		ReleaseFallback: *fallback, Metadata: meta, At: cfg.Now(),
+		ExpectedServices: services, HealthURL: *healthURL, AppURL: *appURL, PreviousOnline: *previousOnline,
+		ReleaseFallback: *fallback, Reason: *reason, Metadata: meta, At: cfg.Now(),
 	})
 }
 
@@ -196,15 +226,54 @@ func runSweep(cfg config) error {
 	cleanup(st, now)
 	var notifications []notification
 	for key, rel := range st.Releases {
-		if rel.NotifiedSuccess || now.Sub(rel.StartedAt) < releaseTimeout {
+		if rel.NotifiedSuccess {
 			continue
 		}
-		failureKey := "incomplete"
-		if !rel.NotifiedFailures[failureKey] {
-			notifications = append(notifications, notification{Kind: "failure", ReleaseKey: key, FailureKey: failureKey, Stage: "release incomplete"})
+		if now.Sub(rel.StartedAt) >= cfg.DelayThreshold && !rel.NotifiedDelayed {
+			notifications = append(notifications, notification{Kind: "delayed", ReleaseKey: key})
+		}
+		if now.Sub(rel.StartedAt) >= releaseTimeout {
+			failureKey := "incomplete"
+			if !rel.NotifiedFailures[failureKey] {
+				notifications = append(notifications, notification{Kind: "failure", ReleaseKey: key, FailureKey: failureKey, Stage: "release incomplete", Reason: "not all services reached a healthy state before the timeout"})
+			}
 		}
 	}
 	return persistAndSend(cfg, st, notifications)
+}
+
+func runHistory(cfg config, args []string) error {
+	flags := flag.NewFlagSet("history", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	project := flags.String("project", "", "optional project name")
+	limit := flags.Int("limit", 20, "maximum number of releases")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *limit <= 0 {
+		return fmt.Errorf("--limit must be positive")
+	}
+	st, err := loadState(cfg)
+	if err != nil {
+		return err
+	}
+	items := make([]*release, 0, len(st.Releases))
+	for _, rel := range st.Releases {
+		if *project == "" || rel.Project == *project {
+			items = append(items, rel)
+		}
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].UpdatedAt.After(items[j].UpdatedAt) })
+	fmt.Fprintln(os.Stdout, "TIME\tSTATUS\tPROJECT\tBUILD\tREVISION\tDURATION")
+	for index, rel := range items {
+		if index >= *limit {
+			break
+		}
+		fmt.Fprintf(os.Stdout, "%s\t%s\t%s\t#%s\t%s\t%s\n",
+			rel.UpdatedAt.Local().Format(time.RFC3339), historyStatus(rel), rel.Project,
+			fallback(rel.Metadata.BuildNumber, "?"), shortRevision(rel.Metadata.Revision), rel.UpdatedAt.Sub(rel.StartedAt).Round(time.Second))
+	}
+	return nil
 }
 
 // runPending exits successfully only while a known release still needs a
@@ -242,12 +311,84 @@ func runPending(cfg config, args []string, input io.Reader) error {
 	return nil
 }
 
-func runTest(cfg config) error {
-	message := "<b>🟢 Deploy Telegram Notifier test</b>\n\nThe Telegram delivery configuration is working."
-	if err := sendTelegram(cfg, message, ""); err != nil {
+func runTest(cfg config, args []string) error {
+	flags := flag.NewFlagSet("test", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	scenario := flags.String("scenario", "", "failure, recovery, delayed, or rollback")
+	appURL := flags.String("app-url", "", "optional public application URL for the test button")
+	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	fmt.Println("test notification sent")
+	if *appURL != "" {
+		if !validHTTPURL(*appURL) {
+			return fmt.Errorf("--app-url is invalid")
+		}
+		cfg.AppURL = *appURL
+	}
+	if *scenario == "" {
+		message := "<b>🟢 Deploy Telegram Notifier test</b>\n\nThe Telegram delivery configuration is working."
+		if err := sendTelegram(cfg, message, "", cfg.AppURL); err != nil {
+			return err
+		}
+		fmt.Println("test notification sent")
+		return nil
+	}
+
+	now := cfg.Now()
+	runID := fmt.Sprintf("test-%s-%d", *scenario, now.UnixNano())
+	project := "deploy-notifier-test-" + *scenario
+	meta := metadata{Repository: "example/deploy-notifier", Branch: "test", BuildNumber: "0", RunID: runID, PipelineURL: "https://github.com/example/deploy-notifier/actions", Commit: "synthetic notification test", Author: "Deploy Telegram Notifier", Revision: "test000"}
+	eventFor := func(service, status, stage, reason string) event {
+		return event{Project: project, Service: service, Status: status, Stage: stage, Reason: reason, ExpectedServices: []string{"api", "web"}, PreviousOnline: true, Metadata: meta, At: cfg.Now()}
+	}
+	switch *scenario {
+	case "failure":
+		if err := process(cfg, eventFor("api", "failed", "migration", "synthetic migration failure")); err != nil {
+			return err
+		}
+	case "recovery":
+		if err := process(cfg, eventFor("api", "failed", "healthcheck", "synthetic healthcheck failure")); err != nil {
+			return err
+		}
+		if err := process(cfg, eventFor("api", "succeeded", "healthcheck", "")); err != nil {
+			return err
+		}
+		if err := process(cfg, eventFor("web", "succeeded", "healthcheck", "")); err != nil {
+			return err
+		}
+	case "delayed":
+		if err := process(cfg, eventFor("api", "started", "pull", "")); err != nil {
+			return err
+		}
+		cfg.Now = func() time.Time { return now.Add(cfg.DelayThreshold + time.Second) }
+		if err := runSweep(cfg); err != nil {
+			return err
+		}
+	case "rollback":
+		deployTestRelease := func(id, revision string) error {
+			meta.RunID, meta.Revision = id, revision
+			for _, service := range []string{"api", "web"} {
+				if err := process(cfg, eventFor(service, "succeeded", "healthcheck", "")); err != nil {
+					return err
+				}
+			}
+			now = now.Add(time.Second)
+			cfg.Now = func() time.Time { return now }
+			return nil
+		}
+		if err := deployTestRelease(runID+"-first", "aaaaaaa"); err != nil {
+			return err
+		}
+		if err := deployTestRelease(runID+"-second", "bbbbbbb"); err != nil {
+			return err
+		}
+		if err := deployTestRelease(runID+"-rollback", "aaaaaaa"); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("--scenario must be failure, recovery, delayed, or rollback")
+	}
+	fmt.Printf("%s test notification sent\n", *scenario)
 	return nil
 }
 
@@ -263,6 +404,9 @@ func process(cfg config, ev event) error {
 	if ev.HealthURL != "" {
 		rel.HealthURL = ev.HealthURL
 	}
+	if ev.AppURL != "" {
+		rel.AppURL = ev.AppURL
+	}
 	rel.ExpectedServices = unionServices(rel.ExpectedServices, ev.ExpectedServices)
 	rel.Services[ev.Service] = serviceState{Status: ev.Status, Stage: ev.Stage, At: ev.At}
 
@@ -270,16 +414,22 @@ func process(cfg config, ev event) error {
 	if ev.Status == "failed" {
 		failureKey := ev.Service + ":" + ev.Stage
 		if !rel.NotifiedFailures[failureKey] {
-			notifications = append(notifications, notification{Kind: "failure", ReleaseKey: key, FailureKey: failureKey, Service: ev.Service, Stage: ev.Stage, PreviousOK: ev.PreviousOnline})
+			notifications = append(notifications, notification{Kind: "failure", ReleaseKey: key, FailureKey: failureKey, Service: ev.Service, Stage: ev.Stage, Reason: ev.Reason, PreviousOK: ev.PreviousOnline})
 		}
 	} else if ev.Status == "succeeded" && allSucceeded(rel) && !rel.NotifiedSuccess {
 		if err := checkPublicHealth(cfg, rel.HealthURL); err != nil {
 			failureKey := "public-health"
 			if !rel.NotifiedFailures[failureKey] {
-				notifications = append(notifications, notification{Kind: "failure", ReleaseKey: key, FailureKey: failureKey, Service: "web", Stage: "public health check", PreviousOK: false})
+				notifications = append(notifications, notification{Kind: "failure", ReleaseKey: key, FailureKey: failureKey, Service: "web", Stage: "public health check", Reason: err.Error(), PreviousOK: false})
 			}
 		} else {
-			notifications = append(notifications, notification{Kind: "success", ReleaseKey: key})
+			kind := "success"
+			if hasNotifiedFailure(rel) {
+				kind = "recovered"
+			} else if rel.Rollback {
+				kind = "rollback"
+			}
+			notifications = append(notifications, notification{Kind: kind, ReleaseKey: key})
 		}
 	}
 	return persistAndSend(cfg, st, notifications)
@@ -302,11 +452,42 @@ func getRelease(st *state, ev event) (string, *release) {
 	}
 	rel := &release{
 		Project: ev.Project, ReleaseID: releaseID, Metadata: ev.Metadata,
-		ExpectedServices: unionServices(nil, ev.ExpectedServices), HealthURL: ev.HealthURL,
+		ExpectedServices: unionServices(nil, ev.ExpectedServices), HealthURL: ev.HealthURL, AppURL: ev.AppURL,
 		StartedAt: ev.At, UpdatedAt: ev.At, Services: map[string]serviceState{}, NotifiedFailures: map[string]bool{},
+	}
+	if previous := latestSuccessful(st, ev.Project, ""); previous != nil {
+		rel.PreviousRevision = previous.Metadata.Revision
+		rel.PreviousReleaseID = previous.ReleaseID
+		rel.Rollback = ev.Metadata.Revision != "" && ev.Metadata.Revision != previous.Metadata.Revision && hasSuccessfulRevision(st, ev.Project, ev.Metadata.Revision)
 	}
 	st.Releases[key] = rel
 	return key, rel
+}
+
+func latestSuccessful(st *state, project, skipKey string) *release {
+	var latest *release
+	for key, rel := range st.Releases {
+		if key == skipKey || rel.Project != project || !rel.NotifiedSuccess {
+			continue
+		}
+		if latest == nil || rel.UpdatedAt.After(latest.UpdatedAt) {
+			latest = rel
+		}
+	}
+	return latest
+}
+
+func hasSuccessfulRevision(st *state, project, revision string) bool {
+	for _, rel := range st.Releases {
+		if rel.Project == project && rel.NotifiedSuccess && rel.Metadata.Revision == revision {
+			return true
+		}
+	}
+	return false
+}
+
+func hasNotifiedFailure(rel *release) bool {
+	return len(rel.NotifiedFailures) > 0
 }
 
 func allSucceeded(rel *release) bool {
@@ -316,6 +497,25 @@ func allSucceeded(rel *release) bool {
 		}
 	}
 	return len(rel.ExpectedServices) > 0
+}
+
+func historyStatus(rel *release) string {
+	if rel.NotifiedSuccess {
+		if hasNotifiedFailure(rel) {
+			return "recovered"
+		}
+		if rel.Rollback {
+			return "rollback"
+		}
+		return "succeeded"
+	}
+	if hasNotifiedFailure(rel) {
+		return "failed"
+	}
+	if rel.NotifiedDelayed {
+		return "delayed"
+	}
+	return "in progress"
 }
 
 func persistAndSend(cfg config, st *state, notifications []notification) error {
@@ -328,14 +528,23 @@ func persistAndSend(cfg config, st *state, notifications []notification) error {
 			continue
 		}
 		message := formatNotification(rel, item, cfg.Now())
-		if err := sendTelegram(cfg, message, rel.Metadata.PipelineURL); err != nil {
+		appURL := rel.AppURL
+		if appURL == "" {
+			appURL = cfg.AppURL
+		}
+		if err := sendTelegram(cfg, message, rel.Metadata.PipelineURL, appURL); err != nil {
 			fmt.Fprintln(os.Stderr, "deploy-telegram-notifier: Telegram delivery failed:", err)
 			continue
 		}
-		if item.Kind == "success" {
+		switch item.Kind {
+		case "success", "recovered", "rollback":
 			rel.NotifiedSuccess = true
-		} else {
+		case "delayed":
+			rel.NotifiedDelayed = true
+		case "failure":
 			rel.NotifiedFailures[item.FailureKey] = true
+			rel.LastFailureStage = item.Stage
+			rel.LastFailureAt = cfg.Now()
 		}
 	}
 	return saveState(cfg, st)
@@ -513,10 +722,42 @@ func checkPublicHealth(cfg config, healthURL string) error {
 }
 
 func formatNotification(rel *release, item notification, now time.Time) string {
-	if item.Kind == "success" {
+	switch item.Kind {
+	case "success":
 		return "<b>🟢 Deploy Succeeded</b>\n\n" + details(rel, "") + "\nDuration: " + html.EscapeString(now.Sub(rel.StartedAt).Round(time.Second).String()) + "\nServices: " + html.EscapeString(strings.Join(rel.ExpectedServices, ", "))
+	case "recovered":
+		return "<b>🟡 Deploy Recovered</b>\n\n" + details(rel, "") + "\nPreviously failed at: " + html.EscapeString(fallback(rel.LastFailureStage, "Unknown")) + "\nRecovery duration: " + html.EscapeString(recoveryDuration(rel, now)) + "\nTotal duration: " + html.EscapeString(now.Sub(rel.StartedAt).Round(time.Second).String()) + "\nServices: " + html.EscapeString(strings.Join(rel.ExpectedServices, ", "))
+	case "rollback":
+		return "<b>↩️ Rollback Succeeded</b>\n\n" + details(rel, "") + "\nFrom: " + html.EscapeString(shortRevision(rel.PreviousRevision)) + "\nTo: " + html.EscapeString(shortRevision(rel.Metadata.Revision)) + "\nDuration: " + html.EscapeString(now.Sub(rel.StartedAt).Round(time.Second).String()) + "\nServices: " + html.EscapeString(strings.Join(rel.ExpectedServices, ", "))
+	case "delayed":
+		return "<b>🟠 Deploy Delayed</b>\n\n" + details(rel, "") + "\nWaiting for: " + html.EscapeString(strings.Join(waitingServices(rel), ", ")) + "\nElapsed: " + html.EscapeString(now.Sub(rel.StartedAt).Round(time.Second).String())
+	default:
+		message := "<b>🔴 Deploy Failed</b>\n\n" + details(rel, "") + "\nService: " + html.EscapeString(item.Service) + "\nStage: " + html.EscapeString(item.Stage)
+		if item.Reason != "" {
+			message += "\nReason: " + html.EscapeString(truncate(item.Reason, 180))
+		}
+		return message + "\nPrevious release online: " + map[bool]string{true: "yes", false: "no"}[item.PreviousOK]
 	}
-	return "<b>🔴 Deploy Failed</b>\n\n" + details(rel, "") + "\nService: " + html.EscapeString(item.Service) + "\nStage: " + html.EscapeString(item.Stage) + "\nPrevious release online: " + map[bool]string{true: "yes", false: "no"}[item.PreviousOK]
+}
+
+func recoveryDuration(rel *release, now time.Time) string {
+	if rel.LastFailureAt.IsZero() {
+		return "Unknown"
+	}
+	return now.Sub(rel.LastFailureAt).Round(time.Second).String()
+}
+
+func waitingServices(rel *release) []string {
+	var waiting []string
+	for _, service := range rel.ExpectedServices {
+		if rel.Services[service].Status != "succeeded" {
+			waiting = append(waiting, service)
+		}
+	}
+	if len(waiting) == 0 {
+		return []string{"public health check"}
+	}
+	return waiting
 }
 
 func details(rel *release, _ string) string {
@@ -552,7 +793,7 @@ func truncate(value string, limit int) string {
 	return string(runes[:limit-1]) + "…"
 }
 
-func sendTelegram(cfg config, message, pipelineURL string) error {
+func sendTelegram(cfg config, message, pipelineURL, appURL string) error {
 	type button struct {
 		Text string `json:"text"`
 		URL  string `json:"url"`
@@ -564,8 +805,15 @@ func sendTelegram(cfg config, message, pipelineURL string) error {
 	if cfg.ThreadID != "" {
 		payload["message_thread_id"] = cfg.ThreadID
 	}
+	buttons := []button{}
 	if validHTTPURL(pipelineURL) {
-		payload["reply_markup"] = keyboard{InlineKeyboard: [][]button{{{Text: "🔍 View Pipeline", URL: pipelineURL}}}}
+		buttons = append(buttons, button{Text: "🔍 View Pipeline", URL: pipelineURL})
+	}
+	if validHTTPURL(appURL) {
+		buttons = append(buttons, button{Text: "🌐 Open Application", URL: appURL})
+	}
+	if len(buttons) > 0 {
+		payload["reply_markup"] = keyboard{InlineKeyboard: [][]button{buttons}}
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

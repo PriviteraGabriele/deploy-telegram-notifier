@@ -17,7 +17,7 @@ func testConfig(t *testing.T, serverURL string) config {
 	t.Helper()
 	return config{
 		BotToken: "token", ChatID: "123", StateDir: t.TempDir(), TelegramAPIURL: serverURL,
-		HTTPClient: &http.Client{Timeout: time.Second}, Now: func() time.Time { return time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC) },
+		DelayThreshold: delayThreshold, HTTPClient: &http.Client{Timeout: time.Second}, Now: func() time.Time { return time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC) },
 	}
 }
 
@@ -96,6 +96,7 @@ func TestSweepReportsIncompleteRelease(t *testing.T) {
 	now := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
 	cfg := testConfig(t, telegram.URL)
 	cfg.Now = func() time.Time { return now }
+	cfg.DelayThreshold = releaseTimeout + time.Minute
 	if err := runEvent(cfg, []string{"--project", "worth-split", "--service", "api", "--status", "started", "--stage", "pull", "--expected-services", "api,web"}, imageJSON("125", "abcdef123456")); err != nil {
 		t.Fatal(err)
 	}
@@ -189,5 +190,123 @@ func TestStateIsWrittenAtomicallyWithPrivatePermissions(t *testing.T) {
 	}
 	if !bytes.Contains(contents, []byte(`"releases"`)) {
 		t.Fatalf("unexpected state: %s", contents)
+	}
+}
+
+func TestFailureIncludesEscapedReasonAndApplicationButton(t *testing.T) {
+	var payload []byte
+	telegram := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		payload, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer telegram.Close()
+	cfg := testConfig(t, telegram.URL)
+	args := []string{"--project", "worth-split", "--service", "api", "--status", "failed", "--stage", "migration", "--reason", "exit <1>", "--app-url", "https://app.example.test", "--previous-online"}
+	if err := runEvent(cfg, args, imageJSON("reason", "abcdef123456")); err != nil {
+		t.Fatal(err)
+	}
+	var message struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(payload, &message); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(message.Text, "Reason: exit &lt;1&gt;") {
+		t.Fatalf("reason is absent or unescaped: %s", payload)
+	}
+	if !bytes.Contains(payload, []byte("Open Application")) {
+		t.Fatalf("application button is missing: %s", payload)
+	}
+}
+
+func TestFailureThenSuccessIsReportedAsRecovery(t *testing.T) {
+	var messages []string
+	telegram := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Text string `json:"text"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		messages = append(messages, payload.Text)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer telegram.Close()
+	health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer health.Close()
+	cfg := testConfig(t, telegram.URL)
+	if err := runEvent(cfg, []string{"--project", "worth-split", "--service", "api", "--status", "failed", "--stage", "healthcheck", "--reason", "timed out"}, imageJSON("recovery", "abcdef123456")); err != nil {
+		t.Fatal(err)
+	}
+	for _, service := range []string{"api", "web"} {
+		if err := runEvent(cfg, []string{"--project", "worth-split", "--service", service, "--status", "succeeded", "--stage", "healthcheck", "--expected-services", "api,web", "--health-url", health.URL}, imageJSON("recovery", "abcdef123456")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(messages) != 2 || !strings.Contains(messages[1], "Deploy Recovered") || !strings.Contains(messages[1], "Previously failed at: healthcheck") {
+		t.Fatalf("unexpected recovery messages: %#v", messages)
+	}
+}
+
+func TestSweepSendsOneDelayedNotification(t *testing.T) {
+	var messages []string
+	telegram := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Text string `json:"text"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		messages = append(messages, payload.Text)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer telegram.Close()
+	now := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	cfg := testConfig(t, telegram.URL)
+	cfg.Now = func() time.Time { return now }
+	if err := runEvent(cfg, []string{"--project", "worth-split", "--service", "api", "--status", "started", "--stage", "pull", "--expected-services", "api,web"}, imageJSON("delayed", "abcdef123456")); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Now = func() time.Time { return now.Add(delayThreshold + time.Second) }
+	if err := runSweep(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := runSweep(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 || !strings.Contains(messages[0], "Deploy Delayed") || !strings.Contains(messages[0], "Waiting for: api, web") {
+		t.Fatalf("unexpected delayed messages: %#v", messages)
+	}
+}
+
+func TestPriorSuccessfulRevisionIsReportedAsRollback(t *testing.T) {
+	var messages []string
+	telegram := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			Text string `json:"text"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		messages = append(messages, payload.Text)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer telegram.Close()
+	health := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	defer health.Close()
+	cfg := testConfig(t, telegram.URL)
+	now := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
+	deploy := func(runID, revision string) {
+		cfg.Now = func() time.Time { return now }
+		for _, service := range []string{"api", "web"} {
+			if err := runEvent(cfg, []string{"--project", "worth-split", "--service", service, "--status", "succeeded", "--stage", "healthcheck", "--expected-services", "api,web", "--health-url", health.URL}, imageJSON(runID, revision)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		now = now.Add(time.Minute)
+	}
+	deploy("first", "aaaaaaa111111")
+	deploy("second", "bbbbbbb222222")
+	deploy("rollback", "aaaaaaa111111")
+	if len(messages) != 3 || !strings.Contains(messages[2], "Rollback Succeeded") || !strings.Contains(messages[2], "From: bbbbbbb") || !strings.Contains(messages[2], "To: aaaaaaa") {
+		t.Fatalf("unexpected rollback messages: %#v", messages)
 	}
 }
